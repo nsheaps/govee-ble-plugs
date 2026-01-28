@@ -14,6 +14,18 @@ from homeassistant.exceptions import ConfigEntryError
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
 
+@dataclasses.dataclass
+class GoveePowerData:
+    """Power monitoring data from Govee device."""
+
+    time_on: int | None = None  # seconds device has been on
+    energy: float | None = None  # Wh accumulated
+    voltage: float | None = None  # V
+    current: float | None = None  # A
+    power: float | None = None  # W
+    power_factor: int | None = None  # percentage
+
+
 def _b(s: str):
     return bytes(bytearray.fromhex(s))
 
@@ -39,6 +51,12 @@ class GoveePlugApi(T.Protocol):
     async def async_turn_on(self, port: int): ...
 
     async def async_turn_off(self, port: int): ...
+
+    def supports_power_monitoring(self) -> bool: ...
+
+    def get_power_data(self) -> GoveePowerData | None: ...
+
+    async def async_request_power_data(self) -> bool: ...
 
 
 class GoveePairApi(T.Protocol):
@@ -136,6 +154,18 @@ class GoveePlugH508x:
 
         self._connection_task: T.Optional[asyncio.Task] = None
         self._msgqueue = asyncio.Queue[T.Tuple[bytes, asyncio.Future[bool]]]()
+
+    def supports_power_monitoring(self) -> bool:
+        """Return True if this device supports power monitoring."""
+        return False
+
+    def get_power_data(self) -> GoveePowerData | None:
+        """Return current power data, or None if not supported."""
+        return None
+
+    async def async_request_power_data(self) -> bool:
+        """Request updated power data from device. Returns True on success."""
+        return False
 
     async def _send_message(self, msg: bytes) -> bool:
         f = asyncio.Future[bool]()
@@ -338,6 +368,8 @@ class GoveePlugH5086(GoveePlugH508x):
     MSG_GET_AUTH_KEY = _b("aab100000000000000000000000000000000001b")
     MSG_TURN_ON = _b("3301010000000000000000000000000000000033")
     MSG_TURN_OFF = _b("3301000000000000000000000000000000000032")
+    # Power monitoring request command: aa00 + 17 zero bytes + checksum (aa)
+    MSG_GET_POWER = _b("aa000000000000000000000000000000000000aa")
 
     SEND_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b11"
     RECV_CHARACTERISTIC_UUID = "00010203-0405-0607-0809-0a0b0c0d2b10"
@@ -347,6 +379,7 @@ class GoveePlugH5086(GoveePlugH508x):
             device, token, self.RECV_CHARACTERISTIC_UUID, self.SEND_CHARACTERISTIC_UUID
         )
         self._is_on = None
+        self._power_data = GoveePowerData()
 
     def port_names(self) -> T.List[T.Tuple[T.Optional[int], T.Optional[str]]]:
         return [(None, None)]
@@ -354,10 +387,125 @@ class GoveePlugH5086(GoveePlugH508x):
     def is_on(self, port: int):
         return self._is_on
 
+    def supports_power_monitoring(self) -> bool:
+        """H5086 supports power monitoring."""
+        return True
+
+    def get_power_data(self) -> GoveePowerData | None:
+        """Return current power data."""
+        return self._power_data
+
     def handle_bluetooth_event(self, device: BLEDevice, adv: AdvertisementData):
         for _, mfr_data in adv.manufacturer_data.items():
             self._device = device
             self._is_on = mfr_data[-1] == 0x01
+
+    def _parse_power_response(self, data: bytes) -> bool:
+        """Parse ee19 power data response.
+
+        Format: ee19 [time:3] [energy:3] [voltage:2] [current:2] [power:3] [factor:1]
+        - time: 3 bytes, seconds device has been on
+        - energy: 3 bytes, in 1/10 Wh units
+        - voltage: 2 bytes, in 1/100 V units
+        - current: 2 bytes, in 1/100 A units
+        - power: 3 bytes, in 1/100 W units
+        - power_factor: 1 byte, percentage
+        """
+        if len(data) < 16 or data[0] != 0xEE or data[1] != 0x19:
+            return False
+
+        # Parse time (3 bytes, big-endian)
+        time_on = (data[2] << 16) | (data[3] << 8) | data[4]
+
+        # Parse energy (3 bytes, big-endian, 1/10 Wh -> Wh)
+        energy_raw = (data[5] << 16) | (data[6] << 8) | data[7]
+        energy = energy_raw / 10.0
+
+        # Parse voltage (2 bytes, big-endian, 1/100 V -> V)
+        voltage_raw = (data[8] << 8) | data[9]
+        voltage = voltage_raw / 100.0
+
+        # Parse current (2 bytes, big-endian, 1/100 A -> A)
+        current_raw = (data[10] << 8) | data[11]
+        current = current_raw / 100.0
+
+        # Parse power (3 bytes, big-endian, 1/100 W -> W)
+        power_raw = (data[12] << 16) | (data[13] << 8) | data[14]
+        power = power_raw / 100.0
+
+        # Parse power factor (1 byte, percentage)
+        power_factor = data[15]
+
+        self._power_data = GoveePowerData(
+            time_on=time_on,
+            energy=energy,
+            voltage=voltage,
+            current=current,
+            power=power,
+            power_factor=power_factor,
+        )
+
+        _LOGGER.debug(
+            "H5086 power data: voltage=%.2fV, current=%.2fA, power=%.2fW, "
+            "energy=%.1fWh, power_factor=%d%%, time_on=%ds",
+            voltage,
+            current,
+            power,
+            energy,
+            power_factor,
+            time_on,
+        )
+        return True
+
+    async def async_request_power_data(self) -> bool:
+        """Request power monitoring data from device."""
+        client = None
+        try:
+            client = await establish_connection(
+                BleakClient,
+                self._device,
+                f"{self._device.name} ({self._device.address})",
+            )
+
+            # Event to track when we receive power data
+            on_auth_ready = asyncio.Event()
+            on_power_data_ready = asyncio.Event()
+
+            async def recv_handler(c, data):
+                if data[0] == 0x33 and data[1] == 0xB2:
+                    on_auth_ready.set()
+                elif data[0] == 0xEE and data[1] == 0x19:
+                    if self._parse_power_response(data):
+                        on_power_data_ready.set()
+
+            await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
+
+            # Authenticate first
+            ba = bytearray([0x33, 0xB2]) + bytearray.fromhex(self._token).ljust(
+                17, b"\0"
+            )
+            ba.append(_sign_payload(ba))
+            await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, ba)
+            await asyncio.wait_for(on_auth_ready.wait(), timeout=5.0)
+
+            # Send power data request
+            await client.write_gatt_char(
+                self._SEND_CHARACTERISTIC_UUID, self.MSG_GET_POWER
+            )
+            await asyncio.wait_for(on_power_data_ready.wait(), timeout=5.0)
+
+            await client.stop_notify(self._RECV_CHARACTERISTIC_UUID)
+            return True
+
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Timeout waiting for power data from H5086")
+            return False
+        except Exception as e:
+            _LOGGER.error("Failed to get power data from H5086: %s", e)
+            return False
+        finally:
+            if client is not None:
+                await client.disconnect()
 
     async def async_turn_on(self, port: int):
         assert port == 0

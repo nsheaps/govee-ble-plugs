@@ -12,7 +12,9 @@ Supported devices:
 
 * H5080 Smart Plug
 * H5082 Dual Smart Plug
-* H5086 Smart Plug with Energy Monitoring (no Energy Monitoring as of 2025/08/23)
+* H5086 Smart Plug with Energy Monitoring
+  * Voltage, Current, Power, Energy, and Power Factor sensors
+  * Power data is polled every 60 seconds
 
 ## Configuration
 
