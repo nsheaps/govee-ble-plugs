@@ -6,7 +6,7 @@
         { "local_name": "ihoment_H5082_*", "connectable": false },
         { "local_name": "GVH5086*", "connectable": false}
     ],
-    "codeowners": ["@virtuald"],
+    "codeowners": ["@virtuald", "@nsheaps"],
     "config_flow": true,
     "dependencies": ["bluetooth"],
     "documentation": "https://github.com/virtuald/govee-ble-plugs",
@@ -14,5 +14,5 @@
     "iot_class": "local_polling",
     "issue_tracker": "https://github.com/virtuald/govee-ble-plugs/issues",
     "requirements": ["bleak-retry-connector"],
-    "version": "0.1.0"
+    "version": "0.2.0"
 }
