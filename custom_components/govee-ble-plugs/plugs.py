@@ -7,7 +7,7 @@ import typing as T
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
-from bleak_retry_connector import establish_connection
+from bleak_retry_connector import establish_connection, BleakClientWithServiceCache
 
 from homeassistant.exceptions import ConfigEntryError
 
@@ -139,6 +139,11 @@ def parse_advertisement_data(
 
 
 class GoveePlugH508x:
+    # TODO: add with self.client(): to return current or new client in context, rather than each
+    # scheduled request creating it's own. Re-use clients when possible, but
+    # close them immediately after use. In async world, when using the with ... : syntax (called a context manager),
+    # the __aenter__ and __aexit__ methods are called to set up and tear down the context. Each should
+    # track references to how many async calls are within the context manager, so that one exiting won't destroy the client
 
     def __init__(
         self,
@@ -462,9 +467,13 @@ class GoveePlugH5086(GoveePlugH508x):
         client = None
         try:
             client = await establish_connection(
-                BleakClient,
+                BleakClientWithServiceCache,
                 self._device,
                 f"{self._device.name} ({self._device.address})",
+                # this can fail and time out, and during retries ends up making
+                # more connections than the device can handle. Only retry 2 times,
+                # and let a future request grab current data, tolerating the gap.
+                max_attempts=2
             )
 
             # Event to track when we receive power data
