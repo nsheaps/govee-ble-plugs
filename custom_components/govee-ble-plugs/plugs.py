@@ -486,13 +486,20 @@ class GoveePlugH5086(GoveePlugH508x):
             )
             ba.append(_sign_payload(ba))
             await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, ba)
-            await asyncio.wait_for(on_auth_ready.wait(), timeout=5.0)
+            await asyncio.wait_for(on_auth_ready.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Timeout waiting to authenticate with H5086")
+            return False
+        except Exception as e:
+            _LOGGER.error("Failed to authenticate with H5086: %s", e)
+            return False
 
+        try:
             # Send power data request
             await client.write_gatt_char(
                 self._SEND_CHARACTERISTIC_UUID, self.MSG_GET_POWER
             )
-            await asyncio.wait_for(on_power_data_ready.wait(), timeout=5.0)
+            await asyncio.wait_for(on_power_data_ready.wait(), timeout=10.0)
 
             await client.stop_notify(self._RECV_CHARACTERISTIC_UUID)
             return True
