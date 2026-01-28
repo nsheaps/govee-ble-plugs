@@ -22,7 +22,7 @@ _LOGGER: logging.Logger = logging.getLogger(__package__)
 PLATFORMS: list[str] = [Platform.SWITCH]
 
 # Interval for polling power data (BLE connections are expensive, don't poll too often)
-POWER_UPDATE_INTERVAL = timedelta(seconds=60)
+POWER_UPDATE_INTERVAL = timedelta(seconds=15)
 
 
 class GoveePlugDataUpdateCoordinator(PassiveBluetoothDataUpdateCoordinator):
