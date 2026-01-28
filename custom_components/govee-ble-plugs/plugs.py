@@ -500,13 +500,14 @@ class GoveePlugH5086(GoveePlugH508x):
         
         except asyncio.TimeoutError:
             _LOGGER.warning("Timeout waiting to authenticate with H5086")
+            if client is not None:
+                await client.disconnect()
             return False
         except Exception as e:
             _LOGGER.exception("Failed to authenticate with H5086: %s", e)
-            return False
-        finally:
             if client is not None:
                 await client.disconnect()
+            return False
 
         try:
             # Send power data request
