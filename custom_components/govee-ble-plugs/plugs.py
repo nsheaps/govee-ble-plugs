@@ -460,6 +460,7 @@ class GoveePlugH5086(GoveePlugH508x):
     async def async_request_power_data(self) -> bool:
         """Request power monitoring data from device."""
         client = None
+        error = False
         try:
             client = await establish_connection(
                 BleakClient,
@@ -487,12 +488,16 @@ class GoveePlugH5086(GoveePlugH508x):
             ba.append(_sign_payload(ba))
             await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, ba)
             await asyncio.wait_for(on_auth_ready.wait(), timeout=10.0)
+        
         except asyncio.TimeoutError:
             _LOGGER.warning("Timeout waiting to authenticate with H5086")
             return False
         except Exception as e:
-            _LOGGER.error("Failed to authenticate with H5086: %s", e)
+            _LOGGER.exception("Failed to authenticate with H5086: %s", e)
             return False
+        finally:
+            if client is not None:
+                await client.disconnect()
 
         try:
             # Send power data request
@@ -508,7 +513,7 @@ class GoveePlugH5086(GoveePlugH508x):
             _LOGGER.warning("Timeout waiting for power data from H5086")
             return False
         except Exception as e:
-            _LOGGER.error("Failed to get power data from H5086: %s", e)
+            _LOGGER.exception("Failed to get power data from H5086: %s", e)
             return False
         finally:
             if client is not None:
