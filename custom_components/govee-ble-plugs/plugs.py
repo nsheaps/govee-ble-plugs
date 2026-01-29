@@ -213,9 +213,17 @@ class GoveePlugH508x:
         try:
             # Pull anything on the message queue directly off, these must
             # be processed one way or another
+            queue_size = 0
             while not self._msgqueue.empty():
                 must_process.put(self._msgqueue.get_nowait())
+                queue_size += 1
 
+            _LOGGER.debug(
+                "%s: _message_task_fn starting, %d messages to process",
+                self._device.name, queue_size
+            )
+
+            _LOGGER.debug("%s: attempting establish_connection with max_attempts=2", self._device.name)
             client = await establish_connection(
                 BleakClient,
                 self._device,
@@ -224,6 +232,7 @@ class GoveePlugH508x:
                 # is unreachable; let future requests retry instead of blocking
                 max_attempts=2,
             )
+            _LOGGER.debug("%s: connection established successfully", self._device.name)
 
             # events to control execution flow
             on_auth_ready = asyncio.Event()
@@ -233,31 +242,43 @@ class GoveePlugH508x:
             pending_rpc_callbacks: T.List[T.Tuple[asyncio.Event, T.Callable[[bytes], bool]]] = []
 
             async def recv_handler(c, data):
+                _LOGGER.debug("%s: recv_handler got data: %s", self._device.name, data.hex() if data else "empty")
+                if len(data) < 2:
+                    _LOGGER.warning("%s: received short data: %d bytes", self._device.name, len(data))
+                    return
                 if data[0] == 0x33 and data[1] == 0xB2:
+                    _LOGGER.debug("%s: auth response received", self._device.name)
                     on_auth_ready.set()
                 elif data[0] == 0x33 and data[1] == 0x01:
+                    _LOGGER.debug("%s: set_state response received", self._device.name)
                     on_set_state_ready.set()
                 else:
                     # Route other responses to pending RPC callbacks
+                    _LOGGER.debug("%s: checking %d pending RPC callbacks", self._device.name, len(pending_rpc_callbacks))
                     for event, callback in pending_rpc_callbacks:
                         if callback(data):
+                            _LOGGER.debug("%s: RPC callback matched", self._device.name)
                             event.set()
                             break
 
             await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
 
+            _LOGGER.debug("%s: sending auth request", self._device.name)
             ba = bytearray([0x33, 0xB2]) + bytearray.fromhex(self._token).ljust(
                 17, b"\0"
             )
             ba.append(_sign_payload(ba))
             await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, ba)
             await asyncio.wait_for(on_auth_ready.wait(), timeout=10.0)
+            _LOGGER.debug("%s: auth successful", self._device.name)
 
             #
             # Send messages after authentication occurs
             #
 
             async def _send_msg(msg: bytes, f: asyncio.Future, recv_callback: T.Optional[T.Callable[[bytes], bool]]):
+                msg_type = "RPC" if recv_callback is not None else "simple"
+                _LOGGER.debug("%s: sending %s message: %s", self._device.name, msg_type, msg.hex())
                 try:
                     if recv_callback is not None:
                         # RPC call - wait for callback to signal completion
@@ -267,6 +288,7 @@ class GoveePlugH508x:
                             await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
                             # 10s timeout matches auth timeout; allows for BLE retransmits
                             await asyncio.wait_for(done_event.wait(), timeout=10.0)
+                            _LOGGER.debug("%s: RPC response received", self._device.name)
                         finally:
                             pending_rpc_callbacks.remove((done_event, recv_callback))
                     else:
@@ -275,7 +297,9 @@ class GoveePlugH508x:
                         on_set_state_ready.clear()
                         await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
                         await on_set_state_ready.wait()
-                except Exception:
+                        _LOGGER.debug("%s: simple message ack received", self._device.name)
+                except Exception as e:
+                    _LOGGER.debug("%s: message failed: %s", self._device.name, e)
                     f.set_result(False)
                     raise
                 else:
