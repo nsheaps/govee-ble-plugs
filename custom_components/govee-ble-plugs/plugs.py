@@ -7,7 +7,7 @@ import typing as T
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
-from bleak_retry_connector import establish_connection, BleakClientWithServiceCache
+from bleak_retry_connector import establish_connection
 
 from homeassistant.exceptions import ConfigEntryError
 
@@ -158,7 +158,7 @@ class GoveePlugH508x:
         self._SEND_CHARACTERISTIC_UUID = SEND_CHARACTERISTIC_UUID
 
         self._connection_task: T.Optional[asyncio.Task] = None
-        self._msgqueue = asyncio.Queue[T.Tuple[bytes, asyncio.Future[bool]]]()
+        self._msgqueue = asyncio.Queue[T.Tuple[bytes, asyncio.Future[bool], T.Optional[T.Callable[[bytes], bool]]]]()
 
     def supports_power_monitoring(self) -> bool:
         """Return True if this device supports power monitoring."""
@@ -171,10 +171,20 @@ class GoveePlugH508x:
     async def async_request_power_data(self) -> bool:
         """Request updated power data from device. Returns True on success."""
         return False
+    
+    async def _rpc_call(self, send_data: bytes, recv_callback: T.Callable[[bytes], bool]) -> bool:
+        """Send message and wait for response via callback.
 
+        The callback receives response bytes and returns True when the expected response arrives.
+        """
+        f = asyncio.Future[bool]()
+        self._msgqueue.put_nowait((send_data, f, recv_callback))
+        self._ensure_message_task()
+        return await f
+    
     async def _send_message(self, msg: bytes) -> bool:
         f = asyncio.Future[bool]()
-        self._msgqueue.put_nowait((msg, f))
+        self._msgqueue.put_nowait((msg, f, None))
         self._ensure_message_task()
         return await f
 
@@ -198,7 +208,7 @@ class GoveePlugH508x:
 
     async def _message_task_fn(self):
         client = None
-        must_process = queue.Queue[T.Tuple[bytes, asyncio.Future]]()
+        must_process = queue.Queue[T.Tuple[bytes, asyncio.Future, T.Optional[T.Callable[[bytes], bool]]]]()
 
         try:
             # Pull anything on the message queue directly off, these must
@@ -215,12 +225,21 @@ class GoveePlugH508x:
             # events to control execution flow
             on_auth_ready = asyncio.Event()
             on_set_state_ready = asyncio.Event()
+            # Track pending RPC callbacks: (event, callback)
+            # Callbacks are checked sequentially; safe due to single-threaded async execution
+            pending_rpc_callbacks: T.List[T.Tuple[asyncio.Event, T.Callable[[bytes], bool]]] = []
 
             async def recv_handler(c, data):
                 if data[0] == 0x33 and data[1] == 0xB2:
                     on_auth_ready.set()
                 elif data[0] == 0x33 and data[1] == 0x01:
                     on_set_state_ready.set()
+                else:
+                    # Route other responses to pending RPC callbacks
+                    for event, callback in pending_rpc_callbacks:
+                        if callback(data):
+                            event.set()
+                            break
 
             await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
 
@@ -235,10 +254,24 @@ class GoveePlugH508x:
             # Send messages after authentication occurs
             #
 
-            async def _send_msg(msg: bytes, f: asyncio.Future):
+            async def _send_msg(msg: bytes, f: asyncio.Future, recv_callback: T.Optional[T.Callable[[bytes], bool]]):
                 try:
-                    await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
-                    await on_set_state_ready.wait()
+                    if recv_callback is not None:
+                        # RPC call - wait for callback to signal completion
+                        done_event = asyncio.Event()
+                        pending_rpc_callbacks.append((done_event, recv_callback))
+                        try:
+                            await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
+                            # 10s timeout matches auth timeout; allows for BLE retransmits
+                            await asyncio.wait_for(done_event.wait(), timeout=10.0)
+                        finally:
+                            pending_rpc_callbacks.remove((done_event, recv_callback))
+                    else:
+                        # Simple message - wait for set_state response
+                        # Clear event to wait for THIS message's response, not a stale one
+                        on_set_state_ready.clear()
+                        await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
+                        await on_set_state_ready.wait()
                 except Exception:
                     f.set_result(False)
                     raise
@@ -247,17 +280,17 @@ class GoveePlugH508x:
 
             # Process must process entries first
             while not must_process.empty():
-                msg, f = must_process.get_nowait()
-                await _send_msg(msg, f)
+                msg, f, recv_callback = must_process.get_nowait()
+                await _send_msg(msg, f, recv_callback)
 
             # Then process anything else that might be in the queue
             while True:
                 try:
-                    msg, f = await asyncio.wait_for(self._msgqueue.get(), timeout=1)
+                    msg, f, recv_callback = await asyncio.wait_for(self._msgqueue.get(), timeout=1)
                 except TimeoutError:
                     break
                 else:
-                    await _send_msg(msg, f)
+                    await _send_msg(msg, f, recv_callback)
 
             await client.stop_notify(self._RECV_CHARACTERISTIC_UUID)
 
@@ -268,7 +301,7 @@ class GoveePlugH508x:
             # was queued while the connection was failing deserves another try
             # and will be requeued when this task's done callback is called
             while not must_process.empty():
-                _, f = must_process.get_nowait()
+                _, f, _ = must_process.get_nowait()
                 f.set_result(False)
 
             if client is not None:
@@ -464,70 +497,13 @@ class GoveePlugH5086(GoveePlugH508x):
 
     async def async_request_power_data(self) -> bool:
         """Request power monitoring data from device."""
-        client = None
-        error = False
-        try:
-            client = await establish_connection(
-                BleakClientWithServiceCache,
-                self._device,
-                f"{self._device.name} ({self._device.address})",
-                # this can fail and time out, and during retries ends up making
-                # more connections than the device can handle. Only retry 2 times,
-                # and let a future request grab current data, tolerating the gap.
-                max_attempts=2
-            )
-
-            # Event to track when we receive power data
-            on_auth_ready = asyncio.Event()
-            on_power_data_ready = asyncio.Event()
-
-            async def recv_handler(c, data):
-                if data[0] == 0x33 and data[1] == 0xB2:
-                    on_auth_ready.set()
-                elif data[0] == 0xEE and data[1] == 0x19:
-                    if self._parse_power_response(data):
-                        on_power_data_ready.set()
-
-            await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
-
-            # Authenticate first
-            ba = bytearray([0x33, 0xB2]) + bytearray.fromhex(self._token).ljust(
-                17, b"\0"
-            )
-            ba.append(_sign_payload(ba))
-            await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, ba)
-            await asyncio.wait_for(on_auth_ready.wait(), timeout=10.0)
-        
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Timeout waiting to authenticate with H5086")
-            if client is not None:
-                await client.disconnect()
-            return False
-        except Exception as e:
-            _LOGGER.exception("Failed to authenticate with H5086: %s", e)
-            if client is not None:
-                await client.disconnect()
+        def power_data_callback(data: bytes) -> bool:
+            """Return True if this is the power data response we're waiting for."""
+            if len(data) >= 2 and data[0] == 0xEE and data[1] == 0x19:
+                return self._parse_power_response(data)
             return False
 
-        try:
-            # Send power data request
-            await client.write_gatt_char(
-                self._SEND_CHARACTERISTIC_UUID, self.MSG_GET_POWER
-            )
-            await asyncio.wait_for(on_power_data_ready.wait(), timeout=10.0)
-
-            await client.stop_notify(self._RECV_CHARACTERISTIC_UUID)
-            return True
-
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Timeout waiting for power data from H5086")
-            return False
-        except Exception as e:
-            _LOGGER.exception("Failed to get power data from H5086: %s", e)
-            return False
-        finally:
-            if client is not None:
-                await client.disconnect()
+        return await self._rpc_call(self.MSG_GET_POWER, power_data_callback)
 
     async def async_turn_on(self, port: int):
         assert port == 0
