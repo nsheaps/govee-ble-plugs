@@ -251,7 +251,7 @@ class GoveePlugH508x:
             )
             ba.append(_sign_payload(ba))
             await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, ba)
-            await on_auth_ready.wait()
+            await asyncio.wait_for(on_auth_ready.wait(), timeout=10.0)
 
             #
             # Send messages after authentication occurs
