@@ -2,6 +2,7 @@ import asyncio
 import dataclasses
 import logging
 import queue
+import time
 import typing as T
 
 from bleak import BleakClient
@@ -12,6 +13,13 @@ from bleak_retry_connector import establish_connection
 from homeassistant.exceptions import ConfigEntryError
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
+
+# Global semaphore to serialize BLE connection attempts across all devices
+# This prevents multiple devices from racing for limited proxy slots
+_CONNECTION_SEMAPHORE = asyncio.Semaphore(1)
+
+# Track connection state globally for debugging
+_ACTIVE_CONNECTIONS: T.Dict[str, float] = {}  # address -> start_time
 
 
 @dataclasses.dataclass
@@ -207,132 +215,144 @@ class GoveePlugH508x:
             self._ensure_message_task()
 
     async def _message_task_fn(self):
+        global _ACTIVE_CONNECTIONS
         client = None
         must_process = queue.Queue[T.Tuple[bytes, asyncio.Future, T.Optional[T.Callable[[bytes], bool]]]]()
 
-        try:
-            # Pull anything on the message queue directly off, these must
-            # be processed one way or another
-            queue_size = 0
-            while not self._msgqueue.empty():
-                must_process.put(self._msgqueue.get_nowait())
-                queue_size += 1
+        # Pull anything on the message queue directly off, these must
+        # be processed one way or another
+        queue_size = 0
+        while not self._msgqueue.empty():
+            must_process.put(self._msgqueue.get_nowait())
+            queue_size += 1
 
-            _LOGGER.debug(
-                "%s: _message_task_fn starting, %d messages to process",
-                self._device.name, queue_size
-            )
+        _LOGGER.debug(
+            "%s: _message_task_fn starting, %d messages to process, active_connections=%s",
+            self._device.name, queue_size, list(_ACTIVE_CONNECTIONS.keys())
+        )
 
-            _LOGGER.debug("%s: attempting establish_connection with max_attempts=2", self._device.name)
-            client = await establish_connection(
-                BleakClient,
-                self._device,
-                f"{self._device.name} ({self._device.address})",
-                # Limit retries to avoid exhausting connection slots when device
-                # is unreachable; let future requests retry instead of blocking
-                max_attempts=2,
-            )
-            _LOGGER.debug("%s: connection established successfully", self._device.name)
+        # Serialize connection attempts to avoid racing for proxy slots
+        _LOGGER.debug("%s: waiting for connection semaphore", self._device.name)
+        async with _CONNECTION_SEMAPHORE:
+            _LOGGER.debug("%s: acquired semaphore", self._device.name)
+            _ACTIVE_CONNECTIONS[self._device.address] = time.time()
 
-            # events to control execution flow
-            on_auth_ready = asyncio.Event()
-            on_set_state_ready = asyncio.Event()
-            # Track pending RPC callbacks: (event, callback)
-            # Callbacks are checked sequentially; safe due to single-threaded async execution
-            pending_rpc_callbacks: T.List[T.Tuple[asyncio.Event, T.Callable[[bytes], bool]]] = []
+            try:
+                _LOGGER.debug("%s: attempting establish_connection with max_attempts=2", self._device.name)
+                client = await establish_connection(
+                    BleakClient,
+                    self._device,
+                    f"{self._device.name} ({self._device.address})",
+                    # Limit retries to avoid exhausting connection slots when device
+                    # is unreachable; let future requests retry instead of blocking
+                    max_attempts=2,
+                )
+                _LOGGER.debug("%s: connection established successfully", self._device.name)
 
-            async def recv_handler(c, data):
-                _LOGGER.debug("%s: recv_handler got data: %s", self._device.name, data.hex() if data else "empty")
-                if len(data) < 2:
-                    _LOGGER.warning("%s: received short data: %d bytes", self._device.name, len(data))
-                    return
-                if data[0] == 0x33 and data[1] == 0xB2:
-                    _LOGGER.debug("%s: auth response received", self._device.name)
-                    on_auth_ready.set()
-                elif data[0] == 0x33 and data[1] == 0x01:
-                    _LOGGER.debug("%s: set_state response received", self._device.name)
-                    on_set_state_ready.set()
-                else:
-                    # Route other responses to pending RPC callbacks
-                    _LOGGER.debug("%s: checking %d pending RPC callbacks", self._device.name, len(pending_rpc_callbacks))
-                    for event, callback in pending_rpc_callbacks:
-                        if callback(data):
-                            _LOGGER.debug("%s: RPC callback matched", self._device.name)
-                            event.set()
-                            break
+                # events to control execution flow
+                on_auth_ready = asyncio.Event()
+                on_set_state_ready = asyncio.Event()
+                # Track pending RPC callbacks: (event, callback)
+                # Callbacks are checked sequentially; safe due to single-threaded async execution
+                pending_rpc_callbacks: T.List[T.Tuple[asyncio.Event, T.Callable[[bytes], bool]]] = []
 
-            await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
-
-            _LOGGER.debug("%s: sending auth request", self._device.name)
-            ba = bytearray([0x33, 0xB2]) + bytearray.fromhex(self._token).ljust(
-                17, b"\0"
-            )
-            ba.append(_sign_payload(ba))
-            await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, ba)
-            await asyncio.wait_for(on_auth_ready.wait(), timeout=10.0)
-            _LOGGER.debug("%s: auth successful", self._device.name)
-
-            #
-            # Send messages after authentication occurs
-            #
-
-            async def _send_msg(msg: bytes, f: asyncio.Future, recv_callback: T.Optional[T.Callable[[bytes], bool]]):
-                msg_type = "RPC" if recv_callback is not None else "simple"
-                _LOGGER.debug("%s: sending %s message: %s", self._device.name, msg_type, msg.hex())
-                try:
-                    if recv_callback is not None:
-                        # RPC call - wait for callback to signal completion
-                        done_event = asyncio.Event()
-                        pending_rpc_callbacks.append((done_event, recv_callback))
-                        try:
-                            await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
-                            # 10s timeout matches auth timeout; allows for BLE retransmits
-                            await asyncio.wait_for(done_event.wait(), timeout=10.0)
-                            _LOGGER.debug("%s: RPC response received", self._device.name)
-                        finally:
-                            pending_rpc_callbacks.remove((done_event, recv_callback))
+                async def recv_handler(c, data):
+                    _LOGGER.debug("%s: recv_handler got data: %s", self._device.name, data.hex() if data else "empty")
+                    if len(data) < 2:
+                        _LOGGER.warning("%s: received short data: %d bytes", self._device.name, len(data))
+                        return
+                    if data[0] == 0x33 and data[1] == 0xB2:
+                        _LOGGER.debug("%s: auth response received", self._device.name)
+                        on_auth_ready.set()
+                    elif data[0] == 0x33 and data[1] == 0x01:
+                        _LOGGER.debug("%s: set_state response received", self._device.name)
+                        on_set_state_ready.set()
                     else:
-                        # Simple message - wait for set_state response
-                        # Clear event to wait for THIS message's response, not a stale one
-                        on_set_state_ready.clear()
-                        await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
-                        await on_set_state_ready.wait()
-                        _LOGGER.debug("%s: simple message ack received", self._device.name)
-                except Exception as e:
-                    _LOGGER.debug("%s: message failed: %s", self._device.name, e)
-                    f.set_result(False)
-                    raise
-                else:
-                    f.set_result(True)
+                        # Route other responses to pending RPC callbacks
+                        _LOGGER.debug("%s: checking %d pending RPC callbacks", self._device.name, len(pending_rpc_callbacks))
+                        for event, callback in pending_rpc_callbacks:
+                            if callback(data):
+                                _LOGGER.debug("%s: RPC callback matched", self._device.name)
+                                event.set()
+                                break
 
-            # Process must process entries first
-            while not must_process.empty():
-                msg, f, recv_callback = must_process.get_nowait()
-                await _send_msg(msg, f, recv_callback)
+                await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
 
-            # Then process anything else that might be in the queue
-            while True:
-                try:
-                    msg, f, recv_callback = await asyncio.wait_for(self._msgqueue.get(), timeout=1)
-                except TimeoutError:
-                    break
-                else:
+                _LOGGER.debug("%s: sending auth request", self._device.name)
+                ba = bytearray([0x33, 0xB2]) + bytearray.fromhex(self._token).ljust(
+                    17, b"\0"
+                )
+                ba.append(_sign_payload(ba))
+                await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, ba)
+                await asyncio.wait_for(on_auth_ready.wait(), timeout=10.0)
+                _LOGGER.debug("%s: auth successful", self._device.name)
+
+                #
+                # Send messages after authentication occurs
+                #
+
+                async def _send_msg(msg: bytes, f: asyncio.Future, recv_callback: T.Optional[T.Callable[[bytes], bool]]):
+                    msg_type = "RPC" if recv_callback is not None else "simple"
+                    _LOGGER.debug("%s: sending %s message: %s", self._device.name, msg_type, msg.hex())
+                    try:
+                        if recv_callback is not None:
+                            # RPC call - wait for callback to signal completion
+                            done_event = asyncio.Event()
+                            pending_rpc_callbacks.append((done_event, recv_callback))
+                            try:
+                                await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
+                                # 10s timeout matches auth timeout; allows for BLE retransmits
+                                await asyncio.wait_for(done_event.wait(), timeout=10.0)
+                                _LOGGER.debug("%s: RPC response received", self._device.name)
+                            finally:
+                                pending_rpc_callbacks.remove((done_event, recv_callback))
+                        else:
+                            # Simple message - wait for set_state response
+                            # Clear event to wait for THIS message's response, not a stale one
+                            on_set_state_ready.clear()
+                            await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
+                            await on_set_state_ready.wait()
+                            _LOGGER.debug("%s: simple message ack received", self._device.name)
+                    except Exception as e:
+                        _LOGGER.debug("%s: message failed: %s", self._device.name, e)
+                        f.set_result(False)
+                        raise
+                    else:
+                        f.set_result(True)
+
+                # Process must process entries first
+                while not must_process.empty():
+                    msg, f, recv_callback = must_process.get_nowait()
                     await _send_msg(msg, f, recv_callback)
 
-            await client.stop_notify(self._RECV_CHARACTERISTIC_UUID)
+                # Then process anything else that might be in the queue
+                while True:
+                    try:
+                        msg, f, recv_callback = await asyncio.wait_for(self._msgqueue.get(), timeout=1)
+                    except TimeoutError:
+                        break
+                    else:
+                        await _send_msg(msg, f, recv_callback)
 
-        except Exception as e:
-            _LOGGER.exception("failed to set state: %s", e)
-        finally:
-            # We only force clearing the must process queue. Anything that
-            # was queued while the connection was failing deserves another try
-            # and will be requeued when this task's done callback is called
-            while not must_process.empty():
-                _, f, _ = must_process.get_nowait()
-                f.set_result(False)
+                await client.stop_notify(self._RECV_CHARACTERISTIC_UUID)
 
-            if client is not None:
-                await client.disconnect()
+            except Exception as e:
+                _LOGGER.exception("failed to set state: %s", e)
+            finally:
+                # Clean up connection tracking
+                _ACTIVE_CONNECTIONS.pop(self._device.address, None)
+                _LOGGER.debug("%s: released semaphore, active_connections=%s", self._device.name, list(_ACTIVE_CONNECTIONS.keys()))
+
+                # We only force clearing the must process queue. Anything that
+                # was queued while the connection was failing deserves another try
+                # and will be requeued when this task's done callback is called
+                while not must_process.empty():
+                    _, f, _ = must_process.get_nowait()
+                    f.set_result(False)
+
+                if client is not None:
+                    await client.disconnect()
+                    _LOGGER.debug("%s: disconnected", self._device.name)
 
 
 class GoveePlugH5080(GoveePlugH508x):
