@@ -2,7 +2,6 @@ import asyncio
 import dataclasses
 import logging
 import queue
-import time
 import typing as T
 
 from bleak import BleakClient
@@ -17,9 +16,6 @@ _LOGGER: logging.Logger = logging.getLogger(__package__)
 # Global semaphore to serialize BLE connection attempts across all devices
 # This prevents multiple devices from racing for limited proxy slots
 _CONNECTION_SEMAPHORE = asyncio.Semaphore(1)
-
-# Track connection state globally for debugging
-_ACTIVE_CONNECTIONS: T.Dict[str, float] = {}  # address -> start_time
 
 
 @dataclasses.dataclass
@@ -215,30 +211,17 @@ class GoveePlugH508x:
             self._ensure_message_task()
 
     async def _message_task_fn(self):
-        global _ACTIVE_CONNECTIONS
         client = None
         must_process = queue.Queue[T.Tuple[bytes, asyncio.Future, T.Optional[T.Callable[[bytes], bool]]]]()
 
         # Pull anything on the message queue directly off, these must
         # be processed one way or another
-        queue_size = 0
         while not self._msgqueue.empty():
             must_process.put(self._msgqueue.get_nowait())
-            queue_size += 1
-
-        _LOGGER.debug(
-            "%s: _message_task_fn starting, %d messages to process, active_connections=%s",
-            self._device.name, queue_size, list(_ACTIVE_CONNECTIONS.keys())
-        )
 
         # Serialize connection attempts to avoid racing for proxy slots
-        _LOGGER.debug("%s: waiting for connection semaphore", self._device.name)
         async with _CONNECTION_SEMAPHORE:
-            _LOGGER.debug("%s: acquired semaphore", self._device.name)
-            _ACTIVE_CONNECTIONS[self._device.address] = time.time()
-
             try:
-                _LOGGER.debug("%s: attempting establish_connection with max_attempts=2", self._device.name)
                 client = await establish_connection(
                     BleakClient,
                     self._device,
@@ -247,7 +230,6 @@ class GoveePlugH508x:
                     # is unreachable; let future requests retry instead of blocking
                     max_attempts=2,
                 )
-                _LOGGER.debug("%s: connection established successfully", self._device.name)
 
                 # events to control execution flow
                 on_auth_ready = asyncio.Event()
@@ -257,43 +239,33 @@ class GoveePlugH508x:
                 pending_rpc_callbacks: T.List[T.Tuple[asyncio.Event, T.Callable[[bytes], bool]]] = []
 
                 async def recv_handler(c, data):
-                    _LOGGER.debug("%s: recv_handler got data: %s", self._device.name, data.hex() if data else "empty")
                     if len(data) < 2:
-                        _LOGGER.warning("%s: received short data: %d bytes", self._device.name, len(data))
                         return
                     if data[0] == 0x33 and data[1] == 0xB2:
-                        _LOGGER.debug("%s: auth response received", self._device.name)
                         on_auth_ready.set()
                     elif data[0] == 0x33 and data[1] == 0x01:
-                        _LOGGER.debug("%s: set_state response received", self._device.name)
                         on_set_state_ready.set()
                     else:
                         # Route other responses to pending RPC callbacks
-                        _LOGGER.debug("%s: checking %d pending RPC callbacks", self._device.name, len(pending_rpc_callbacks))
                         for event, callback in pending_rpc_callbacks:
                             if callback(data):
-                                _LOGGER.debug("%s: RPC callback matched", self._device.name)
                                 event.set()
                                 break
 
                 await client.start_notify(self._RECV_CHARACTERISTIC_UUID, recv_handler)
 
-                _LOGGER.debug("%s: sending auth request", self._device.name)
                 ba = bytearray([0x33, 0xB2]) + bytearray.fromhex(self._token).ljust(
                     17, b"\0"
                 )
                 ba.append(_sign_payload(ba))
                 await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, ba)
                 await asyncio.wait_for(on_auth_ready.wait(), timeout=10.0)
-                _LOGGER.debug("%s: auth successful", self._device.name)
 
                 #
                 # Send messages after authentication occurs
                 #
 
                 async def _send_msg(msg: bytes, f: asyncio.Future, recv_callback: T.Optional[T.Callable[[bytes], bool]]):
-                    msg_type = "RPC" if recv_callback is not None else "simple"
-                    _LOGGER.debug("%s: sending %s message: %s", self._device.name, msg_type, msg.hex())
                     try:
                         if recv_callback is not None:
                             # RPC call - wait for callback to signal completion
@@ -303,7 +275,6 @@ class GoveePlugH508x:
                                 await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
                                 # 10s timeout matches auth timeout; allows for BLE retransmits
                                 await asyncio.wait_for(done_event.wait(), timeout=10.0)
-                                _LOGGER.debug("%s: RPC response received", self._device.name)
                             finally:
                                 pending_rpc_callbacks.remove((done_event, recv_callback))
                         else:
@@ -312,9 +283,7 @@ class GoveePlugH508x:
                             on_set_state_ready.clear()
                             await client.write_gatt_char(self._SEND_CHARACTERISTIC_UUID, msg)
                             await on_set_state_ready.wait()
-                            _LOGGER.debug("%s: simple message ack received", self._device.name)
-                    except Exception as e:
-                        _LOGGER.debug("%s: message failed: %s", self._device.name, e)
+                    except Exception:
                         f.set_result(False)
                         raise
                     else:
@@ -339,10 +308,6 @@ class GoveePlugH508x:
             except Exception as e:
                 _LOGGER.exception("failed to set state: %s", e)
             finally:
-                # Clean up connection tracking
-                _ACTIVE_CONNECTIONS.pop(self._device.address, None)
-                _LOGGER.debug("%s: released semaphore, active_connections=%s", self._device.name, list(_ACTIVE_CONNECTIONS.keys()))
-
                 # We only force clearing the must process queue. Anything that
                 # was queued while the connection was failing deserves another try
                 # and will be requeued when this task's done callback is called
@@ -352,7 +317,6 @@ class GoveePlugH508x:
 
                 if client is not None:
                     await client.disconnect()
-                    _LOGGER.debug("%s: disconnected", self._device.name)
 
 
 class GoveePlugH5080(GoveePlugH508x):
@@ -547,7 +511,6 @@ class GoveePlugH5086(GoveePlugH508x):
         """Request power monitoring data from device."""
         # Skip if a request is already in flight to prevent queue buildup
         if self._power_request_in_flight:
-            _LOGGER.debug("%s: power request already in flight, skipping", self._device.name)
             return False
 
         def power_data_callback(data: bytes) -> bool:
