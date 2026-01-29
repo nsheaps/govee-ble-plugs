@@ -220,6 +220,9 @@ class GoveePlugH508x:
                 BleakClient,
                 self._device,
                 f"{self._device.name} ({self._device.address})",
+                # Limit retries to avoid exhausting connection slots when device
+                # is unreachable; let future requests retry instead of blocking
+                max_attempts=2,
             )
 
             # events to control execution flow
