@@ -69,7 +69,6 @@ class GoveePlugDataUpdateCoordinator(PassiveBluetoothDataUpdateCoordinator):
     async def _async_update_power_data(self, *args) -> None:
         """Update power monitoring data."""
         if self.api.supports_power_monitoring():
-            _LOGGER.debug("Requesting power data update")
             if await self.api.async_request_power_data():
                 self.async_update_listeners()
 
