@@ -445,6 +445,7 @@ class GoveePlugH5086(GoveePlugH508x):
         )
         self._is_on = None
         self._power_data = GoveePowerData()
+        self._power_request_in_flight = False
 
     def port_names(self) -> T.List[T.Tuple[T.Optional[int], T.Optional[str]]]:
         return [(None, None)]
@@ -524,13 +525,22 @@ class GoveePlugH5086(GoveePlugH508x):
 
     async def async_request_power_data(self) -> bool:
         """Request power monitoring data from device."""
+        # Skip if a request is already in flight to prevent queue buildup
+        if self._power_request_in_flight:
+            _LOGGER.debug("%s: power request already in flight, skipping", self._device.name)
+            return False
+
         def power_data_callback(data: bytes) -> bool:
             """Return True if this is the power data response we're waiting for."""
             if len(data) >= 2 and data[0] == 0xEE and data[1] == 0x19:
                 return self._parse_power_response(data)
             return False
 
-        return await self._rpc_call(self.MSG_GET_POWER, power_data_callback)
+        self._power_request_in_flight = True
+        try:
+            return await self._rpc_call(self.MSG_GET_POWER, power_data_callback)
+        finally:
+            self._power_request_in_flight = False
 
     async def async_turn_on(self, port: int):
         assert port == 0
