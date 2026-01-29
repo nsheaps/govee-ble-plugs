@@ -295,7 +295,7 @@ class GoveePlugH508x:
             await client.stop_notify(self._RECV_CHARACTERISTIC_UUID)
 
         except Exception as e:
-            _LOGGER.error("failed to set state: %s", e)
+            _LOGGER.exception("failed to set state: %s", e)
         finally:
             # We only force clearing the must process queue. Anything that
             # was queued while the connection was failing deserves another try
